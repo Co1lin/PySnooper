@@ -7,6 +7,8 @@ import opcode
 import os
 import sys
 import re
+import json
+import pickle
 import collections
 import datetime as datetime_module
 import itertools
@@ -237,7 +239,7 @@ class Tracer:
     def __init__(self, output=None, watch=(), watch_explode=(), depth=1,
                  prefix='', overwrite=False, thread_info=False, custom_repr=(),
                  max_variable_length=100, normalize=False, relative_time=False,
-                 color=True, source_paths=[], exclude_paths=[]):
+                 color=True, source_paths=[], exclude_paths=[], save_framed_traces=''):
         self._write = get_write_function(output, overwrite)
 
         self.watch = [
@@ -303,6 +305,14 @@ class Tracer:
 
         self.source_paths = process_paths(source_paths)
         self.exclude_paths = process_paths(exclude_paths)
+        self.frame_to_lines = dict()
+        self.exclude_frames = set()
+        self.last_frame_info = None
+        self.save_framed_traces = save_framed_traces
+        if save_framed_traces:
+            self.trace = self.trace_save_framed
+        else:
+            self.trace = self.trace_output
 
     def __call__(self, function_or_class):
         if DISABLED:
@@ -396,11 +406,21 @@ class Tracer:
         duration = datetime_module.datetime.now() - start_time
         elapsed_time_string = pycompat.timedelta_format(duration)
         indent = ' ' * 4 * (thread_global.depth + 1)
-        self.write(
-            '{indent}{_FOREGROUND_YELLOW}{_STYLE_DIM}'
-            'Elapsed time: {_STYLE_NORMAL}{elapsed_time_string}'
-            '{_STYLE_RESET_ALL}'.format(**locals())
-        )
+        if self.save_framed_traces:
+            if self.save_framed_traces.endswith('.json'):
+                with open(self.save_framed_traces, 'w') as f:
+                    json.dump(self.frame_to_lines, fp=f, indent=2)
+            elif self.save_framed_traces.endswith('.pkl'):
+                with open(self.save_framed_traces + '.pkl', 'wb') as f:
+                    pickle.dump(self.frame_to_lines, file=f)
+            else:
+                raise ValueError(f'save_framed_traces = {self.save_framed_traces}')
+        else:
+            self.write(
+                '{indent}{_FOREGROUND_YELLOW}{_STYLE_DIM}'
+                'Elapsed time: {_STYLE_NORMAL}{elapsed_time_string}'
+                '{_STYLE_RESET_ALL}'.format(**locals())
+            )
         #                                                                     #
         ### Finished writing elapsed time. ####################################
 
@@ -413,7 +433,7 @@ class Tracer:
                                        current_thread_len)
         return thread_info.ljust(self.thread_info_padding)
 
-    def trace(self, frame, event, arg):
+    def trace_output(self, frame, event, arg):
 
         ### Checking whether we should trace this line: #######################
         #                                                                     #
@@ -599,5 +619,191 @@ class Tracer:
             self.write('{indent}{_FOREGROUND_RED}Exception:..... '
                        '{_STYLE_BRIGHT}{exception}'
                        '{_STYLE_RESET_ALL}'.format(**locals()))
+
+        return self.trace
+    
+    def trace_save_framed(self, frame, event, arg):
+
+        ### Checking whether we should trace this line: #######################
+        #                                                                     #
+        # We should trace this line either if it's in the decorated function,
+        # or the user asked to go a few levels deeper and we're within that
+        # number of levels deeper.
+        if self.source_paths and not (
+            frame.f_code.co_filename[0] == '/' and # in case of '<frozen xxx>'
+            any(_path_eq_or_sub(frame.f_code.co_filename, p) for p in self.source_paths)
+        ):
+            return None
+        
+        if self.exclude_paths and (
+            frame.f_code.co_filename[0] == '/' and # in case of '<frozen xxx>'
+            any(_path_eq_or_sub(frame.f_code.co_filename, p) for p in self.exclude_paths)
+        ):
+            return None
+
+        if not (frame.f_code in self.target_codes or frame in self.target_frames):
+            if self.depth == 1:
+                # We did the most common and quickest check above, because the
+                # trace function runs so incredibly often, therefore it's
+                # crucial to hyper-optimize it for the common case.
+                return None
+            elif self._is_internal_frame(frame):
+                return None
+            else:
+                _frame_candidate = frame
+                for i in range(1, self.depth):
+                    _frame_candidate = _frame_candidate.f_back
+                    if _frame_candidate is None:
+                        return None
+                    elif _frame_candidate.f_code in self.target_codes or _frame_candidate in self.target_frames:
+                        break
+                else:
+                    return None
+
+        #                                                                     #
+        ### Finished checking whether we should trace this line. ##############
+
+        if event == 'call':
+            thread_global.depth += 1
+        indent = ' ' * 4 * thread_global.depth
+
+        ### Making timestamp: #################################################
+        #                                                                     #
+        if self.normalize:
+            timestamp = ' ' * 15
+        elif self.relative_time:
+            try:
+                start_time = self.start_times[frame]
+            except KeyError:
+                start_time = self.start_times[frame] = \
+                                                 datetime_module.datetime.now()
+            duration = datetime_module.datetime.now() - start_time
+            timestamp = pycompat.timedelta_format(duration)
+        else:
+            timestamp = pycompat.time_isoformat(
+                datetime_module.datetime.now().time(),
+                timespec='microseconds'
+            )
+        #                                                                     #
+        ### Finished making timestamp. ########################################
+        
+        ### Getting lineno and source info: ###################################
+        #                                                                     #
+        line_no = frame.f_lineno
+        source_path, source = get_path_and_source_from_frame(frame)
+        source_path = source_path if not self.normalize else os.path.basename(source_path)
+        if self.last_source_path != source_path:
+            self.last_source_path = source_path
+        source_line = source[line_no - 1]
+        # Dealing with misplaced function definition:
+        if event == 'call' and source_line.lstrip().startswith('@'):
+            # If a function decorator is found, skip lines until an actual
+            # function definition is found.
+            for candidate_line_no in itertools.count(line_no):
+                try:
+                    candidate_source_line = source[candidate_line_no - 1]
+                except IndexError:
+                    # End of source file reached without finding a function
+                    # definition. Fall back to original source line.
+                    break
+
+                if candidate_source_line.lstrip().startswith('def'):
+                    # Found the def line!
+                    line_no = candidate_line_no
+                    source_line = candidate_source_line
+                    break
+        
+        if source_line == 'SOURCE IS UNAVAILABLE':
+            return self.trace
+        #                                                                     #
+        ### Finished getting lineno and source info. ##########################
+
+        ### Reporting newish and modified variables: ##########################
+        #                                                                     #
+        new_vars = collections.OrderedDict()
+        modified_vars = collections.OrderedDict()
+        old_local_reprs = self.frame_to_local_reprs.get(frame, {})
+        self.frame_to_local_reprs[frame] = local_reprs = \
+                                       get_local_reprs(frame,
+                                                       watch=self.watch, custom_repr=self.custom_repr,
+                                                       max_length=self.max_variable_length,
+                                                       normalize=self.normalize,
+                                                       )
+
+        newish_string = ('Starting var:.. ' if event == 'call' else
+                                                            'New var:....... ')
+
+        for name, value_repr in local_reprs.items():
+            if name not in old_local_reprs:
+                new_vars[name] = value_repr
+            elif old_local_reprs[name] != value_repr:
+                modified_vars[name] = value_repr
+
+        #                                                                     #
+        ### Finished newish and modified variables. ###########################
+
+        ### Return values and exceptions: #####################################
+        #                                                                     #
+        # If a call ends due to an exception, we still get a 'return' event
+        # with arg = None. This seems to be the only way to tell the difference
+        # https://stackoverflow.com/a/12800909/2482744
+        code_byte = frame.f_code.co_code[frame.f_lasti]
+        if not isinstance(code_byte, int):
+            code_byte = ord(code_byte)
+        ended_by_exception = (
+            event == 'return'
+            and arg is None
+            and opcode.opname[code_byte] not in RETURN_OPCODES
+        )
+
+        if event == 'return':
+            self.frame_to_local_reprs.pop(frame, None)
+            self.start_times.pop(frame, None)
+            thread_global.depth -= 1
+
+            if not ended_by_exception:
+                return_value_repr = utils.get_shortish_repr(arg,
+                                                            custom_repr=self.custom_repr,
+                                                            max_length=self.max_variable_length,
+                                                            normalize=self.normalize,
+                                                            )
+        
+        if event == 'exception':
+            exception = '\n'.join(traceback.format_exception_only(*arg[:2])).strip()
+            if self.max_variable_length:
+                exception = utils.truncate(exception, self.max_variable_length)
+        #                                                                     #
+        ### Finished return values and exceptions. ############################
+
+        frame_id = id(frame)
+        if frame_id in self.exclude_frames:
+            return self.trace
+
+        frame_info_list = self.frame_to_lines.get(frame_id, [])
+        # [ src_path, [], [], ... ]
+        if frame_info_list:
+            # assert frame_info_list[0] == source_path, f'{frame_info_list[0]} != {source_path}'
+            if source_path != frame_info_list[0]:
+                # from IPython import embed; embed()
+                self.exclude_frames.add(frame_id)
+                self.frame_to_lines.pop(frame_id)
+                return self.trace
+        else:
+            frame_info_list.append(source_path)
+        frame_info_list.append([
+            event, # 0
+            timestamp, # 1
+            line_no, # 2
+            source_line, # 3
+            new_vars, # 4,
+            modified_vars, # 5
+            ended_by_exception, # 6,
+            return_value_repr # 7
+                if event == 'return' and not ended_by_exception else None,
+            exception if event == 'exception' else None, # 8
+            # self.last_frame_info,
+        ])
+        self.frame_to_lines[frame_id] = frame_info_list
+        # self.last_frame_info = (frame_id, source_path, line_no, source_line)
 
         return self.trace
