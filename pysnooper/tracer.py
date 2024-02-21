@@ -629,6 +629,8 @@ class Tracer:
         # We should trace this line either if it's in the decorated function,
         # or the user asked to go a few levels deeper and we're within that
         # number of levels deeper.
+        if not frame.f_code.co_filename:
+            return None
         if self.source_paths and not (
             frame.f_code.co_filename[0] == '/' and # in case of '<frozen xxx>'
             any(_path_eq_or_sub(frame.f_code.co_filename, p) for p in self.source_paths)
