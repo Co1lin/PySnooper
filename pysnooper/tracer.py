@@ -407,12 +407,17 @@ class Tracer:
         elapsed_time_string = pycompat.timedelta_format(duration)
         indent = ' ' * 4 * (thread_global.depth + 1)
         if self.save_framed_traces:
+            frame_to_lines = {
+                frame: info_list
+                for frame, info_list in self.frame_to_lines.items()
+                if info_list[1]
+            }
             if self.save_framed_traces.endswith('.json'):
                 with open(self.save_framed_traces, 'w') as f:
-                    json.dump(self.frame_to_lines, fp=f, indent=2)
+                    json.dump(frame_to_lines, fp=f, indent=2)
             elif self.save_framed_traces.endswith('.pkl'):
                 with open(self.save_framed_traces + '.pkl', 'wb') as f:
-                    pickle.dump(self.frame_to_lines, file=f)
+                    pickle.dump(frame_to_lines, file=f)
             else:
                 raise ValueError(f'save_framed_traces = {self.save_framed_traces}')
         else:
@@ -782,16 +787,15 @@ class Tracer:
             return self.trace
 
         frame_info_list = self.frame_to_lines.get(frame_id, [])
-        # [ src_path, [], [], ... ]
+        # [ src_path, True/False, [], [], ... ]
         if frame_info_list:
-            # assert frame_info_list[0] == source_path, f'{frame_info_list[0]} != {source_path}'
             if source_path != frame_info_list[0]:
-                # from IPython import embed; embed()
                 self.exclude_frames.add(frame_id)
                 self.frame_to_lines.pop(frame_id)
                 return self.trace
         else:
             frame_info_list.append(source_path)
+            frame_info_list.append(False)
         frame_info_list.append([
             event, # 0
             timestamp, # 1
@@ -805,6 +809,21 @@ class Tracer:
             exception if event == 'exception' else None, # 8
             # self.last_frame_info,
         ])
+        # if this frame contains any useful trace
+        if not frame_info_list[1]:
+            for name, val in list(new_vars.items()) + list(modified_vars.items()):
+                assert isinstance(name, str) and isinstance(val, str)
+                if name.startswith('__') and name.endswith('__'):
+                    continue
+                if (
+                    any(val.startswith(p) for p in [
+                        '<function', '<module', '<class', '<enum', '<_frozen'
+                    ])
+                ):
+                    continue
+                frame_info_list[1] = True
+                break
+        # end if
         self.frame_to_lines[frame_id] = frame_info_list
         # self.last_frame_info = (frame_id, source_path, line_no, source_line)
 
