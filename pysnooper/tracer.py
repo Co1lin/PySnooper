@@ -811,7 +811,8 @@ class Tracer:
         ])
         # if this frame contains any useful trace
         if not frame_info_list[1]:
-            for name, val in list(new_vars.items()) + list(modified_vars.items()):
+            # for name, val in list(new_vars.items()) + list(modified_vars.items()):
+            for name, val in modified_vars.items():
                 assert isinstance(name, str) and isinstance(val, str)
                 if name.startswith('__') and name.endswith('__'):
                     continue
