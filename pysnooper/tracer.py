@@ -238,8 +238,9 @@ class Tracer:
     '''
     def __init__(self, output=None, watch=(), watch_explode=(), depth=1,
                  prefix='', overwrite=False, thread_info=False, custom_repr=(),
-                 max_variable_length=100, normalize=False, relative_time=False,
-                 color=True, source_paths=[], exclude_paths=[], save_framed_traces=''):
+                 custom_class_repr=None, max_variable_length=100, normalize=False, 
+                 relative_time=False, color=True,
+                 source_paths=[], exclude_paths=[], save_framed_traces=''):
         self._write = get_write_function(output, overwrite)
 
         self.watch = [
@@ -263,6 +264,10 @@ class Tracer:
                       pycompat.collections_abc.Iterable) for x in custom_repr):
             custom_repr = (custom_repr,)
         self.custom_repr = custom_repr
+        if custom_class_repr:
+            self.class_repr = custom_class_repr
+        else:
+            self.class_repr = lambda v: repr(type(v))
         self.last_source_path = None
         self.max_variable_length = max_variable_length
         self.normalize = normalize
@@ -374,26 +379,27 @@ class Tracer:
         if DISABLED:
             return
         thread_global.__dict__.setdefault('depth', -1)
-        calling_frame = inspect.currentframe().f_back
-        if not self._is_internal_frame(calling_frame):
-            calling_frame.f_trace = self.trace
-            self.target_frames.add(calling_frame)
+        self.calling_frame = inspect.currentframe().f_back
+        if not self._is_internal_frame(self.calling_frame):
+            self.calling_frame.f_trace = self.trace
+            self.target_frames.add(self.calling_frame)
 
         stack = self.thread_local.__dict__.setdefault(
             'original_trace_functions', []
         )
         stack.append(sys.gettrace())
-        self.start_times[calling_frame] = datetime_module.datetime.now()
+        self.start_times[self.calling_frame] = datetime_module.datetime.now()
         sys.settrace(self.trace)
+        self.exited = False
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
-        if DISABLED:
+        if DISABLED or self.exited:
             return
         stack = self.thread_local.original_trace_functions
         sys.settrace(stack.pop())
-        calling_frame = inspect.currentframe().f_back
-        self.target_frames.discard(calling_frame)
-        self.frame_to_local_reprs.pop(calling_frame, None)
+        # self.calling_frame = inspect.currentframe().f_back
+        self.target_frames.discard(self.calling_frame)
+        self.frame_to_local_reprs.pop(self.calling_frame, None)
 
         ### Writing elapsed time: #############################################
         #                                                                     #
@@ -402,7 +408,7 @@ class Tracer:
         _STYLE_NORMAL = self._STYLE_NORMAL
         _STYLE_RESET_ALL = self._STYLE_RESET_ALL
 
-        start_time = self.start_times.pop(calling_frame)
+        start_time = self.start_times.pop(self.calling_frame)
         duration = datetime_module.datetime.now() - start_time
         elapsed_time_string = pycompat.timedelta_format(duration)
         indent = ' ' * 4 * (thread_global.depth + 1)
@@ -428,6 +434,7 @@ class Tracer:
             )
         #                                                                     #
         ### Finished writing elapsed time. ####################################
+        self.exited = True
 
     def _is_internal_frame(self, frame):
         return frame.f_code.co_filename == Tracer.__enter__.__code__.co_filename
@@ -751,12 +758,7 @@ class Tracer:
                 print(e) # TODO
                 print(self.watch)
                 from IPython import embed; embed()
-            t = repr(type(value))
-            # <class 'name.to.match'>
-            if t.startswith("<class '") and t.endswith("'>"):
-                return t[ len("<class '") : -len("'>") ]
-            else:
-                raise ValueError(f'trace_save_framed: Unexpected repr(type(value)) = {t}')
+            return self.class_repr(value)
 
         for name, value_repr in local_reprs.items():
             if name not in old_local_reprs:
