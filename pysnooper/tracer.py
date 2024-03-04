@@ -740,11 +740,29 @@ class Tracer:
         newish_string = ('Starting var:.. ' if event == 'call' else
                                                             'New var:....... ')
 
+        all_local_vars = {**frame.f_locals}
+        for watch_var in self.watch:
+            all_local_vars.update(watch_var.items(frame, get_value=True))
+
+        def _get_var_type(name):
+            try:
+                value = all_local_vars[name]
+            except KeyError as e:
+                print(e) # TODO
+                print(self.watch)
+                from IPython import embed; embed()
+            t = repr(type(value))
+            # <class 'name.to.match'>
+            if t.startswith("<class '") and t.endswith("'>"):
+                return t[ len("<class '") : -len("'>") ]
+            else:
+                raise ValueError(f'trace_save_framed: Unexpected repr(type(value)) = {t}')
+
         for name, value_repr in local_reprs.items():
             if name not in old_local_reprs:
-                new_vars[name] = value_repr
+                new_vars[name] = (value_repr, _get_var_type(name))
             elif old_local_reprs[name] != value_repr:
-                modified_vars[name] = value_repr
+                modified_vars[name] = (value_repr, _get_var_type(name))
 
         #                                                                     #
         ### Finished newish and modified variables. ###########################
@@ -812,14 +830,15 @@ class Tracer:
         # if this frame contains any useful trace
         if not frame_info_list[1]:
             # for name, val in list(new_vars.items()) + list(modified_vars.items()):
-            for name, val in modified_vars.items():
+            for name, (val, _) in modified_vars.items():
                 assert isinstance(name, str) and isinstance(val, str)
                 if name.startswith('__') and name.endswith('__'):
                     continue
                 if (
                     any(val.startswith(p) for p in [
-                        '<function', '<module', '<class', '<enum', '<_frozen'
-                    ])
+                        '<function', '<module', '<class', '<enum', '<_frozen',
+                        '<bound method', '<method',
+                    ]) and val.endswith('>')
                 ):
                     continue
                 frame_info_list[1] = True
